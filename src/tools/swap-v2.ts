@@ -1,11 +1,12 @@
-import SaucerSwapV2ParameterNormaliser from "../saucer-swap-v2-parameter-normaliser";
+import SaucerSwapV2ParameterNormaliser, {
+    NormalisedSwapV2Params,
+    ResolvedSwapV2Context,
+} from "../saucer-swap-v2-parameter-normaliser";
 import { swapV2Parameters } from "../saucer-swap.zod";
 import {
-    AccountResolver,
     AgentMode,
     BaseTool,
     Context,
-    contractExecuteTransactionParametersNormalised,
     getMirrornodeService,
     handleTransaction,
     HederaBuilder,
@@ -18,31 +19,50 @@ import { z } from "zod";
 import { Client, Status } from "@hiero-ledger/sdk";
 import { SaucerSwapV2ConfigService } from "../service/saucer-swap-v2-config-service";
 import { SaucerSwapApiServiceImpl } from "../service/saucer-swap-rest-pools-service";
-import { SaucerSwapError, TokenNotAssociatedError } from "../errors";
-import { getHederaTokenAddress, getHederaTokenEVMAddress, getTokenDecimals, toBaseUnit } from "../utils";
+import { SaucerSwapTokenRegistry } from "../service/token-registry-service";
+import { SaucerSwapError, TokenNotAssociatedError, logToolError } from "../errors";
+import { describeTokenForUser } from "../utils";
 import { isTokenAssociated } from "../utils/token-association";
 import { ensureTokenAllowance } from "../utils/token-allowance";
-import { PoolFinderService } from "../service/pool-finder-service";
+import { LIST_TOKENS_TOOL } from "./list-saucerswap-tokens";
 
 const swapV2Prompt = (context: Context = {}) => `
 ${PromptGenerator.getContextSnippet(context)}
 
-This tool will swap tokens using the SaucerSwap V2 protocol. If the recipient
-has not associated the output token, the tool will associate it first (only
-works when the recipient equals the signing account; otherwise the call fails
-with a clear error and the recipient must associate the token themselves).
-When tokenIn is not native HBAR / WHBAR, the tool also grants an
-AccountAllowance to the SwapRouter contract for amountIn before swapping.
+This tool will swap tokens using the SaucerSwap V2 protocol. It spends the user's funds, so
+confirm the pair and the amount first — quoting with get_swap_quote_v2_tool beforehand is the norm.
+
+Token parameters accept whatever the user said: a symbol, a token name, a Hedera token id or an
+EVM address, resolved against live pool data. Never invent a token id — call ${LIST_TOKENS_TOOL}
+when you are unsure which token is meant. If the tool reports AMBIGUOUS_TOKEN, relay the
+candidates and let the user pick an id instead of choosing for them.
+
+Amounts are in display units: "swap 100 HBAR" means amountIn: 100.
+
+If the recipient has not associated the output token, the tool will associate it first (only
+works when the recipient equals the signing account; otherwise the call fails with a clear error
+and the recipient must associate the token themselves). When tokenIn is not native HBAR / WHBAR,
+the tool also grants an AccountAllowance to the SwapRouter contract for amountIn before swapping.
+
+Asking for HBAR as tokenOut pays out native HBAR: the router unwraps WHBAR as part of the same
+transaction, so the recipient needs no WHBAR association and their HBAR balance goes up.
 
 Parameters:
-- tokenIn (str, required): The input token address
-- tokenOut (str, required): The output token address
-- amountIn (number, required): The amount of input tokens to swap
-- recipientAddress (str, required): The address to receive the output tokens
+- tokenIn (str, required): The token being sold. Symbol, name, Hedera id ("0.0.456858") or EVM address. "HBAR" is routed via WHBAR.
+- tokenOut (str, required): The token being bought, same formats.
+- amountIn (number, required): The amount of tokenIn to sell, in display units.
+- recipientAddress (str, optional): The account to receive the output tokens. Defaults to the operator account.
+
+Note: the swap executes at whatever price the pool gives — there is no slippage limit — so keep
+amounts modest on low-liquidity pairs.
 `;
 
-const postProcess = (response: RawTransactionResponse) =>
-    `Swap successful.\nTransaction ID: ${response.transactionId}`;
+const postProcess = (response: RawTransactionResponse, resolved: ResolvedSwapV2Context) =>
+    `Swapped ${resolved.amountInDisplay} ` +
+    `${describeTokenForUser(resolved.tokenIn.symbol, resolved.tokenIn.id, resolved.isInputWrappedHBAR)} ` +
+    `for ${describeTokenForUser(resolved.tokenOut.symbol, resolved.tokenOut.id, resolved.isOutputWrappedHBAR)} ` +
+    `through the ${resolved.feePercent}% fee pool, ` +
+    `sent to ${resolved.recipientAccountId}.\nTransaction ID: ${response.transactionId}`;
 
 const resolveSignerAccountId = (context: Context, client: Client): string | undefined => {
     if (context.mode === AgentMode.RETURN_BYTES) {
@@ -78,16 +98,14 @@ const ensureTokenAssociated = async (
 
 type SwapV2RawParams = z.infer<ReturnType<typeof swapV2Parameters>>;
 
-type SwapV2NormalisedParams = {
-    swapParams: z.infer<ReturnType<typeof contractExecuteTransactionParametersNormalised>>;
-    prep: {
-        recipientAccountId: string;
-        tokenInHederaId: string;
-        tokenOutHederaId: string;
-        amountInBase: number | undefined;
-        spenderAccountId: string | undefined;
-        isInputWrappedHBAR: boolean;
-    };
+type SwapV2NormalisedParams = NormalisedSwapV2Params & {
+    /** The SwapRouter, which needs an allowance when the input is not native HBAR. */
+    spenderAccountId?: string;
+};
+
+type SwapV2CoreActionResult = {
+    transaction: ReturnType<typeof HederaBuilder.executeTransaction>;
+    resolved: ResolvedSwapV2Context;
 };
 
 export const SWAP_V2_TOOL = 'swap_v2_tool';
@@ -113,37 +131,20 @@ export class SwapV2Tool extends BaseTool<SwapV2RawParams, SwapV2NormalisedParams
         const mirrorNode = getMirrornodeService(context.mirrornodeService, client.ledgerId!);
         const config = new SaucerSwapV2ConfigService(client.ledgerId!);
         const api = new SaucerSwapApiServiceImpl(client.ledgerId!, config.getSaucerSwapApiKey());
+        const registry = await SaucerSwapTokenRegistry.load(
+            api,
+            config.getWrappedHBARTokenId().toString(),
+        );
 
-        const recipientAccountId = AccountResolver.resolveAccount(params.recipientAddress, context, client);
-        const tokenInHederaId = getHederaTokenAddress(params.tokenIn);
-        const tokenOutHederaId = getHederaTokenAddress(params.tokenOut);
-        const tokenInEvm = getHederaTokenEVMAddress(params.tokenIn);
-        const wrappedHBarEvm = config.getWrappedHBarEvmAddress();
-        const isInputWrappedHBAR = tokenInEvm.toLowerCase() === wrappedHBarEvm.toLowerCase();
-
-        let amountInBase: number | undefined;
-        let spenderAccountId: string | undefined;
-        if (!isInputWrappedHBAR) {
-            const pool = await PoolFinderService.findPoolForTokens(tokenInHederaId, tokenOutHederaId, api);
-            const decimals = getTokenDecimals(pool, tokenInHederaId);
-            amountInBase = toBaseUnit(params.amountIn, decimals).toNumber();
-            spenderAccountId = config.getSwapRouterContractId().toString();
-        }
-
-        const swapParams = await SaucerSwapV2ParameterNormaliser.normaliseSwapV2Params(
-            params, context, config, api, mirrorNode, client,
+        const normalised = await SaucerSwapV2ParameterNormaliser.normaliseSwapV2Params(
+            params, context, config, registry, mirrorNode, client,
         );
 
         return {
-            swapParams,
-            prep: {
-                recipientAccountId,
-                tokenInHederaId,
-                tokenOutHederaId,
-                amountInBase,
-                spenderAccountId,
-                isInputWrappedHBAR,
-            },
+            ...normalised,
+            spenderAccountId: normalised.resolved.isInputWrappedHBAR
+                ? undefined
+                : config.getSwapRouterContractId().toString(),
         };
     }
 
@@ -151,50 +152,62 @@ export class SwapV2Tool extends BaseTool<SwapV2RawParams, SwapV2NormalisedParams
         normalisedParams: SwapV2NormalisedParams,
         context: Context,
         client: Client,
-    ) {
+    ): Promise<SwapV2CoreActionResult> {
         const mirrorNode = getMirrornodeService(context.mirrornodeService, client.ledgerId!);
-        const { swapParams, prep } = normalisedParams;
+        const { contractParams, resolved, spenderAccountId } = normalisedParams;
 
-        await ensureTokenAssociated(prep.recipientAccountId, prep.tokenOutHederaId, context, client, mirrorNode);
+        if (!resolved.isOutputWrappedHBAR) {
+            await ensureTokenAssociated(
+                resolved.recipientAccountId, resolved.tokenOut.id, context, client, mirrorNode,
+            );
+        }
 
-        if (!prep.isInputWrappedHBAR) {
+        if (!resolved.isInputWrappedHBAR) {
             const ownerAccountId = resolveSignerAccountId(context, client);
             if (!ownerAccountId) {
                 throw new SaucerSwapError('Cannot resolve owner account for token allowance', 'OWNER_UNRESOLVED');
             }
             await ensureTokenAllowance(
                 ownerAccountId,
-                prep.spenderAccountId!,
-                prep.tokenInHederaId,
-                prep.amountInBase!,
+                spenderAccountId!,
+                resolved.tokenIn.id,
+                resolved.amountInBase,
+                resolved.tokenIn.decimals,
                 context,
                 client,
                 mirrorNode,
             );
         }
 
-        return HederaBuilder.executeTransaction(swapParams);
+        // Carrying `resolved` through to the secondary action is what lets the
+        // confirmation name the tokens instead of just echoing a transaction id.
+        return { transaction: HederaBuilder.executeTransaction(contractParams), resolved };
     }
 
     async secondaryAction(
-        transaction: ReturnType<typeof HederaBuilder.executeTransaction>,
+        coreActionResult: SwapV2CoreActionResult,
         client: Client,
         context: Context,
     ) {
-        return await handleTransaction(transaction, client, context, postProcess);
+        const { transaction, resolved } = coreActionResult;
+        return await handleTransaction(transaction, client, context, response =>
+            postProcess(response, resolved),
+        );
     }
 
     async handleError(error: unknown, _context: Context) {
         const desc = 'Failed to swap tokens';
         let message: string;
+        let code: string | undefined;
         if (error instanceof SaucerSwapError) {
+            code = error.code;
             message = `${desc}: ${error.message} (code: ${error.code})`;
         } else if (error instanceof Error) {
             message = `${desc}: ${error.message}`;
         } else {
             message = `${desc}: Unknown error occurred`;
         }
-        console.error('[swap_v2_tool]', message, error);
+        logToolError(SWAP_V2_TOOL, message, error);
         return {
             raw: {
                 status: Status.InvalidTransaction.toString(),
@@ -204,6 +217,7 @@ export class SwapV2Tool extends BaseTool<SwapV2RawParams, SwapV2NormalisedParams
                 topicId: null,
                 scheduleId: null,
                 error: message,
+                code,
             },
             humanMessage: message,
         };

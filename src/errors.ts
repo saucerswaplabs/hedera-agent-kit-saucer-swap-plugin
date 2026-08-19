@@ -10,14 +10,77 @@ export class SaucerSwapError extends Error {
   }
 }
 
+/**
+ * Logs a tool failure.
+ *
+ * A `SaucerSwapError` is an expected turn in a conversation — an unknown symbol, an
+ * unlisted pair — and the agent relays it to the user, so it gets one line. Anything
+ * else is a real fault and keeps its stack trace.
+ */
+export const logToolError = (toolName: string, message: string, error: unknown): void => {
+  if (error instanceof SaucerSwapError) {
+    console.error(`[${toolName}]`, message);
+    return;
+  }
+  console.error(`[${toolName}]`, message, error);
+};
+
 export class PoolNotFoundError extends SaucerSwapError {
-  constructor(tokenA: string, tokenB: string) {
+  constructor(tokenA: string, tokenB: string, hint?: string) {
     super(
-      `Pool not found for tokens ${tokenA} and ${tokenB}`,
+      `Pool not found for tokens ${tokenA} and ${tokenB}.${hint ? ` ${hint}` : ''}`,
       'POOL_NOT_FOUND'
     );
     this.name = 'PoolNotFoundError';
     Object.setPrototypeOf(this, PoolNotFoundError.prototype);
+  }
+}
+
+/**
+ * Raised when a token reference typed by a user cannot be matched to any token
+ * that has SaucerSwap V2 liquidity. Carries suggestions so the agent can offer
+ * alternatives instead of inventing a token id.
+ */
+export class TokenNotFoundError extends SaucerSwapError {
+  constructor(
+    public readonly query: string,
+    public readonly suggestions: string[],
+    role?: string,
+  ) {
+    const where = role ? ` for ${role}` : '';
+    const hint = suggestions.length
+      ? ` Tokens with the most SaucerSwap V2 liquidity right now: ${suggestions.join(', ')}.`
+      : '';
+    super(
+      `No token with SaucerSwap V2 liquidity matches "${query}"${where}.${hint}` +
+        ` Call list_saucerswap_tokens_tool for the tradable list instead of guessing a token id.`,
+      'TOKEN_NOT_FOUND'
+    );
+    this.name = 'TokenNotFoundError';
+    Object.setPrototypeOf(this, TokenNotFoundError.prototype);
+  }
+}
+
+/**
+ * Raised when a symbol or name matches several tokens (Hedera lets anyone mint
+ * a token called "USDC"). The agent is expected to relay the candidates and let
+ * the user pick the exact token id.
+ */
+export class AmbiguousTokenError extends SaucerSwapError {
+  constructor(
+    public readonly query: string,
+    public readonly candidates: string[],
+    role?: string,
+  ) {
+    const where = role ? ` for ${role}` : '';
+    super(
+      `"${query}"${where} matches ${candidates.length} different tokens on SaucerSwap: ` +
+        `${candidates.join(' | ')}. Ask the user which one they mean, then call again with that ` +
+        `token's Hedera id (0.0.x). Do not pick one on the user's behalf.`,
+      'AMBIGUOUS_TOKEN'
+    );
+    this.name = 'AmbiguousTokenError';
+    Object.setPrototypeOf(this, AmbiguousTokenError.prototype);
   }
 }
 

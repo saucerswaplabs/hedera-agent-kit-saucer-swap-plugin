@@ -7,6 +7,7 @@ export default defineConfig([
 		format: ["cjs", "esm"],
 		dts: true,
 		sourcemap: true,
-		external: ["@hiero-ledger/sdk", "@hashgraph/hedera-agent-kit", "@hashgraph/hedera-agent-kit-langchain"],
+		clean: true,
+		skipNodeModulesBundle: true,
 	},
 ]);

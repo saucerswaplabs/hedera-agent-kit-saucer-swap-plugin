@@ -11,6 +11,16 @@ const SAUCERSWAP_REST_BASE_URLS: Record<SaucerSwapRestNetwork, string> = {
 };
 
 /**
+ * Answering a single chat message can hit this endpoint several times — listing
+ * tokens, resolving a symbol, then finding the pool — and the payload is the same
+ * every time. A short shared cache keeps that to one request without letting
+ * prices go stale.
+ */
+const POOLS_CACHE_TTL_MS = 30_000;
+
+const poolsCache = new Map<string, { expiresAt: number; pools: Promise<SaucerSwapV2CompactPool[]> }>();
+
+/**
  * Service to access SaucerSwap REST API V2 pools endpoint:
  * GET /v2/pools – "Get compact data for all SaucerSwap V2 pools".
  *
@@ -35,6 +45,21 @@ export class SaucerSwapApiServiceImpl implements SaucerSwapApiService {
    * GET {baseUrl}/v2/pools
    */
   async getAllPoolsCompact(): Promise<SaucerSwapV2CompactPool[]> {
+    const cacheKey = this.baseUrl;
+    const cached = poolsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.pools;
+    }
+
+    const pools = this.fetchAllPoolsCompact();
+    poolsCache.set(cacheKey, { expiresAt: Date.now() + POOLS_CACHE_TTL_MS, pools });
+    // A failed fetch must not be served for the rest of the TTL.
+    pools.catch(() => poolsCache.delete(cacheKey));
+
+    return pools;
+  }
+
+  private async fetchAllPoolsCompact(): Promise<SaucerSwapV2CompactPool[]> {
     const url = `${this.baseUrl}/v2/pools`;
 
     const response = await fetch(url, {

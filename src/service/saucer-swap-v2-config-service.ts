@@ -1,4 +1,3 @@
-// write a config service to get the config from the config file
 import { SaucerSwapConfig, saucerSwapConfig } from "../config";
 import { ContractId, LedgerId, TokenId } from "@hiero-ledger/sdk";
 
@@ -11,7 +10,6 @@ export class SaucerSwapV2ConfigService {
         this.ledgerId = ledgerId;
     }
 
-    //get router address
     getRouterAddress() {
         return this.saucerSwapConfig.networks[this.ledgerId.toString() as keyof typeof this.saucerSwapConfig.networks]?.router ?? '';
     }
@@ -29,7 +27,6 @@ export class SaucerSwapV2ConfigService {
     }
 
     getSaucerSwapApiKey() {
-        //get the api key from environment variable
         const apiKey = process.env.SAUCERSWAP_API_KEY;
         if (!apiKey) {
             throw new Error('SAUCERSWAP_API_KEY is not set');
@@ -37,7 +34,6 @@ export class SaucerSwapV2ConfigService {
         return apiKey;
     }
 
-    //get quoter address
     getQuoterAddress() {
         return this.saucerSwapConfig.networks[this.ledgerId.toString() as keyof typeof this.saucerSwapConfig.networks]?.quoter ?? '';
     }
