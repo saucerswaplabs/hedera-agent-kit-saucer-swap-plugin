@@ -116,6 +116,54 @@ export class ConfigurationError extends SaucerSwapError {
   }
 }
 
+export class OrderbookApiError extends SaucerSwapError {
+  /** true when the failing response carried a JSON body with a server error message. */
+  public hasJsonErrorBody = false;
+
+  constructor(message: string, public readonly statusCode?: number) {
+    super(`Orderbook API error: ${message}`, 'ORDERBOOK_API_ERROR');
+    this.name = 'OrderbookApiError';
+    Object.setPrototypeOf(this, OrderbookApiError.prototype);
+  }
+}
+
+
+export class OrderbookAuthError extends SaucerSwapError {
+  constructor(message: string) {
+    super(`Orderbook authentication failed: ${message}`, 'ORDERBOOK_AUTH_ERROR');
+    this.name = 'OrderbookAuthError';
+    Object.setPrototypeOf(this, OrderbookAuthError.prototype);
+  }
+}
+
+/**
+ * Raised when the client's operator signing capability is unavailable —
+ * orderbook trading tools sign off-chain messages (auth challenge + EIP-712
+ * orders) with the operator key, so they only work in AUTONOMOUS mode with a
+ * configured operator.
+ */
+export class OperatorSigningUnavailableError extends SaucerSwapError {
+  constructor(detail: string) {
+    super(
+      `Operator signing unavailable: ${detail}. Orderbook trading tools require AUTONOMOUS mode with an operator configured on the client (orders are signed off-chain, so RETURN_BYTES mode is not supported).`,
+      'OPERATOR_SIGNING_UNAVAILABLE'
+    );
+    this.name = 'OperatorSigningUnavailableError';
+    Object.setPrototypeOf(this, OperatorSigningUnavailableError.prototype);
+  }
+}
+
+export class OrderbookBatchLimitError extends SaucerSwapError {
+  constructor(what: string, count: number, max: number) {
+    super(
+      `Too many ${what}: ${count} (max ${max} per request)`,
+      'ORDERBOOK_BATCH_LIMIT'
+    );
+    this.name = 'OrderbookBatchLimitError';
+    Object.setPrototypeOf(this, OrderbookBatchLimitError.prototype);
+  }
+}
+
 export class TokenNotAssociatedError extends SaucerSwapError {
   constructor(accountId: string, tokenId: string, signerAccountId?: string) {
     const signerHint = signerAccountId

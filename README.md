@@ -1,6 +1,6 @@
 # SaucerSwap Plugin for Hedera Agent Kit
 
-A plugin for the Hedera Agent Kit that enables SaucerSwap V2 DeFi operations on Hedera, including token swaps and quote queries.
+A plugin for the Hedera Agent Kit that supports token discovery, SaucerSwap V2 AMM swaps and quotes, and V3 orderbook market data and trading.
 
 ## Features
 
@@ -8,6 +8,8 @@ A plugin for the Hedera Agent Kit that enables SaucerSwap V2 DeFi operations on 
 - **Name Resolution**: Accept symbols and names in chat, and ask the user to choose when one matches several tokens
 - **Token Swaps**: Execute token swaps on SaucerSwap V2 protocol
 - **Quote Queries**: Get swap quotes to estimate output amounts before executing swaps
+- **V3 Orderbook Market Data**: List markets, depth, trades and quotes
+- **V3 Orderbook Trading**: Place, list and cancel off-chain-signed orders
 - **Network Support**: Works with Hedera Mainnet and Testnet
 - **Automatic Pool Discovery**: Picks the deepest fee tier for a token pair
 
@@ -73,7 +75,7 @@ const hederaAgentToolkit = new HederaLangchainToolkit({
 
 ## Available Tools
 
-### Token references
+### V2 token references
 
 Every `tokenIn` / `tokenOut` / `token` parameter accepts any of:
 
@@ -88,7 +90,10 @@ exact name, then substring. The first tier that matches wins, and a tier matchin
 token raises `AMBIGUOUS_TOKEN` rather than silently picking the largest — Hedera lets anyone mint
 a token called `USDC`, so the choice belongs to the user.
 
-Amounts are always in display units: `swap 100 HBAR` means `amountIn: 100`, not 10 000 000 000.
+V2 amounts are in display units: `swap 100 HBAR` means `amountIn: 100`, not 10 000 000 000.
+For swaps, the user must also approve an exact minimum output. Pass it as the decimal string
+`amountOutMinimum`, using the **output** token's display units; for example, `"6.6"` means at
+least 6.6 USDC when USDC is the output. A quote alone does not authorize that minimum.
 
 ### Discovery tools
 
@@ -124,8 +129,15 @@ Amounts are always in display units: `swap 100 HBAR` means `amountIn: 100`, not 
     - `tokenIn` (string, required): The token being sold
     - `tokenOut` (string, required): The token being bought
     - `amountIn` (number, required): The amount of `tokenIn` to sell, in display units
+    - `amountOutMinimum` (string, required): The user's positive minimum `tokenOut` amount in display units, as a plain decimal string
     - `recipientAddress` (string, optional): The address to receive the output tokens (defaults to operator account)
-  - Returns: Transaction ID and a confirmation naming both tokens
+  - Returns: Transaction ID and a confirmation naming both tokens and the minimum output
+  - The minimum is converted exactly using the resolved output token's decimals and enforced by
+    the router, including native-HBAR unwrapping. Missing, malformed, nonpositive, nonrepresentable
+    and uint256-overflow minimums are rejected before association, allowance or transaction
+    execution. Insignificant trailing zeros are accepted; nonzero excess precision is never rounded down.
+  - Ask the user for the minimum when it is absent. Never invent a default, derive a replacement
+    from a fresh quote, or lower it after a failed swap.
 
 ### Error codes
 
@@ -138,6 +150,47 @@ Failures carry a `code` so the agent can react instead of only apologising:
 | `POOL_NOT_FOUND` | The pair shares no pool | Suggest a counterpart from the error's route list |
 | `SAME_TOKEN` | Both sides resolved to one token | Ask which two tokens were meant |
 | `AMOUNT_BELOW_MINIMUM` | The amount floors to zero base units | Ask for at least the stated minimum |
+
+### V3 Orderbook Tools
+
+The V3 orderbook tools talk to the SaucerSwap Orderbook API
+(`https://orderbook-api.saucerswap.finance` on mainnet,
+`https://testnet-orderbook-api.saucerswap.finance` on testnet; selected from
+the client's ledger ID).
+
+| Tool | Type | Auth | Description |
+|---|---|---|---|
+| `get_orderbooks_v3_tool` | read | none | List orderbook markets (pagination + filters): token ids/EVM addresses, decimals, price/volume stats, `tickStep`/`sizeStep`/`lotSize`/`minNotional`, `takerFeePips`/`makerFeePips`, `status`, `isAMMEnabled` |
+| `get_orderbook_depth_v3_tool` | read | none | Depth snapshot for one market: best bid/ask, spread, `[price, size]` string ladders, `lastUpdateId` |
+| `get_orderbook_trades_v3_tool` | read | none | Public trade tape: timestamp (ms), human-readable price and `amountBase`, direction, transaction hash |
+| `get_orderbook_quote_v3_tool` | read | none | Market-order simulation (exact-input / exact-output). `slippageBps` is a fixed applied buffer, not market impact. Returned `snapped*`/`suggested*` amounts map directly onto order building |
+| `place_orderbook_order_v3_tool` | **write** | JWT + operator key | Full placement flow: JWT auth (challenge → operator-signed nonce → verify), server-side build (server-assigned nonces), EIP-712 signing of the returned order structs with the operator key, save. Places REAL orders — requires explicit user opt-in |
+| `cancel_orderbook_orders_v3_tool` | **write** | JWT + operator key | Cancel by order ids (≤500) or emergency nonce-floor cancel-all. Asynchronous: the 202/PENDING response acknowledges forwarding, not completion — confirm via order history |
+| `get_my_orderbook_orders_v3_tool` | read (authenticated) | JWT + operator key | Paginated list of the operator account's own orders with status/direction/type/time filters |
+
+Notes:
+
+- All uint256 amounts (`inputAmount`, `outputAmount`, nonces, deadlines) travel
+  as **decimal strings** end to end — never JavaScript numbers.
+- Trading tools sign off-chain messages with the agent-kit client's operator
+  key (ED25519 or ECDSA), so they require `AgentMode.AUTONOMOUS` with an
+  operator configured; `RETURN_BYTES` mode is not supported for orderbook
+  trading. Keys, JWTs, and signatures are never logged.
+- Fee-related values on this API are expressed in **pips** (1 pip = 1e-6), not
+  basis points.
+- The `orderbookId` filter of `get_orderbooks_v3_tool` is applied client-side:
+  the server-side `orderbookId` query parameter on `GET /books` returns 404
+  for every id on the current live deploy (both networks, observed
+  2026-09-15), so the plugin fetches the listing and narrows locally.
+- The place-order tool refuses to sign any built order whose tokens, amounts,
+  flags, or recipient deviate from the request (anti-blind-signing guard);
+  only the server-assigned nonce/reactor and a documented deadline clamp may
+  differ, and the signed economics are echoed back in the tool output.
+- This local `0.4.0-rc.1` candidate integrates the previously checked V3 tools
+  with upstream token discovery and V2 fixes. The earlier V3 public-read
+  evidence was collected on 2026-09-15; it does not qualify this combined
+  candidate or a release. Live place/cancel/list-own-orders testing with a
+  funded testnet operator remains outstanding.
 
 ## Configuration
 
@@ -161,8 +214,9 @@ lists tokens, resolves a symbol and then quotes makes one HTTP request rather th
 
 - **Single-hop routing.** A swap only works when both tokens share a pool. `POOL_NOT_FOUND`
   reports what each token *can* be traded against so the agent can propose a workable pair.
-- **No slippage limit.** Swaps are submitted with `amountOutMinimum: 0`, so they execute at
-  whatever price the pool gives. Keep amounts modest on thin pairs.
+- **No automatic slippage calculation.** The caller must supply the user's approved minimum
+  output. A swap below that floor reverts; changing the minimum requires a new user instruction.
+  Published 0.3.1 does not enforce this requirement; these changes belong to the local 0.4.0-rc.1 candidate.
 
 ## Development
 
@@ -224,9 +278,9 @@ user  > quote 100 hbar to usdc
 agent > Swapping 100 HBAR returns about 6.68 USDC. Rate: 1 HBAR ≈ 0.0668 USDC.
         Routed through the 0.15% fee pool.
 
-user  > do it
-        -> swap_v2_tool { tokenIn: "HBAR", tokenOut: "0.0.456858", amountIn: 100 }
-agent > Swapped 100 HBAR (0.0.1456986) for USDC (0.0.456858) through the 0.15% fee pool.
+user  > swap it, but receive at least 6.6 USDC
+        -> swap_v2_tool { tokenIn: "HBAR", tokenOut: "0.0.456858", amountIn: 100, amountOutMinimum: "6.6" }
+agent > Swapped 100 native HBAR for USDC (0.0.456858), with a minimum of 6.6 USDC, through the 0.15% fee pool.
         Transaction ID: 0.0.5273913@1755164231.123456789
 ```
 
