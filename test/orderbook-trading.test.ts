@@ -1,20 +1,27 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentMode, Context } from "@hashgraph/hedera-agent-kit";
-import { Client, PrivateKey } from "@hiero-ledger/sdk";
+import { AccountId, Client, PrivateKey } from "@hiero-ledger/sdk";
 import { ethers } from "ethers";
 import placeOrderbookOrderV3Tool from "../src/tools/place-orderbook-order-v3";
 import { clearOrderbookSessionCaches } from "../src/service/orderbook-api-service";
 import { EIP712_ORDER_TYPES } from "../src/service/orderbook-signing-service";
+import * as orderbookSigning from "../src/service/orderbook-signing-service";
 import {
   HUGE_NONCE,
   MockOrderbookServer,
   RecordedCall,
-  sampleBuiltOrder,
+  sampleBuiltOrder as originalBuiltOrder,
   sampleDomain,
 } from "./helpers/mock-orderbook-server";
 
 const context: Context = { mode: AgentMode.AUTONOMOUS };
 const OPERATOR_ID = "0.0.12345";
+const OPERATOR_RECIPIENT = "0x0000000000000000000000000000000000003039";
+const OTHER_RECIPIENT = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const sampleBuiltOrder = (overrides: Record<string, unknown> = {}) => originalBuiltOrder({
+  output: { ...originalBuiltOrder().output, recipient: OPERATOR_RECIPIENT },
+  ...overrides,
+});
 
 const HEDERA_MSG_PREFIX = "\x19Hedera Signed Message:\n";
 const CHALLENGE_MESSAGE = "Sign this message to authenticate: nonce-abc-123";
@@ -76,6 +83,7 @@ describe("place_orderbook_order_v3_tool", () => {
   afterEach(() => {
     server.uninstall();
     client.close();
+    vi.restoreAllMocks();
   });
 
   it("runs the full flow: challenge → sign → verify → domain → build → sign order → save (ED25519)", async () => {
@@ -88,7 +96,7 @@ describe("place_orderbook_order_v3_tool", () => {
     // The signed economics are surfaced verbatim to the user
     expect(result.humanMessage).toContain("signed to sell 1000000 of 0x0000000000000000000000000000000000120f46");
     expect(result.humanMessage).toContain("min 16500 of 0x000000000000000000000000000000000006f89a");
-    expect(result.humanMessage).toContain("recipient 0x2222222222222222222222222222222222222222");
+    expect(result.humanMessage).toContain(`recipient ${OPERATOR_RECIPIENT}`);
     expect(result.humanMessage).toContain("deadline 1893456000");
 
     // 1. Challenge sent for the operator account
@@ -169,6 +177,126 @@ describe("place_orderbook_order_v3_tool", () => {
     );
     expect(ethers.recoverAddress(hash, innerSig)).toBe(expectedAddress);
     ecdsaClient.close();
+  });
+
+  it("rejects a substituted recipient when omitted before signing or saving", async () => {
+    const sign = vi.spyOn(orderbookSigning, "signOrder");
+    installTradingRoutes(server, sampleBuiltOrder({
+      output: { ...sampleBuiltOrder().output, recipient: OTHER_RECIPIENT },
+    }));
+
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, limitOrderParams);
+
+    expect(result.humanMessage).toContain("Refusing to sign");
+    expect(result.humanMessage).toContain(`recipient requested ${OPERATOR_RECIPIENT}`);
+    expect(sign).not.toHaveBeenCalled();
+    expect(server.callsTo("POST", "/orders/save")).toHaveLength(0);
+  });
+
+  it("binds an omitted recipient to the trusted operator account before building", async () => {
+    installTradingRoutes(server);
+
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, limitOrderParams);
+
+    expect(result.humanMessage).toContain("Submitted 1 order(s)");
+    const build = server.callsTo("POST", "/orders/build")[0].body as {
+      orderRequests: { recipient: string }[];
+    };
+    expect(build.orderRequests[0].recipient).toBe(OPERATOR_RECIPIENT);
+    const save = server.callsTo("POST", "/orders/save")[0].body as {
+      items: { order: { output: { recipient: string } } }[];
+    };
+    expect(save.items[0].order.output.recipient).toBe(OPERATOR_RECIPIENT);
+  });
+
+  it("binds an omitted recipient to the operator's configured EVM alias", async () => {
+    client.setOperator(AccountId.fromEvmAddress(0, 0, OTHER_RECIPIENT), operatorKey);
+    installTradingRoutes(server, sampleBuiltOrder({
+      output: { ...sampleBuiltOrder().output, recipient: OTHER_RECIPIENT },
+    }));
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, limitOrderParams);
+    expect(result.humanMessage).toContain("Submitted 1 order(s)");
+    const build = server.callsTo("POST", "/orders/build")[0].body as {
+      orderRequests: { recipient: string }[];
+    };
+    expect(build.orderRequests[0].recipient).toBe(OTHER_RECIPIENT);
+  });
+
+  it.each(["key alias", "zero account", "nonzero realm"])("refuses an unresolved %s default before any API or signature", async (kind) => {
+    const account = kind === "key alias" ? `0.0.${operatorKey.publicKey.toString()}`
+      : kind === "zero account" ? "0.0.0" : "0.1.12345";
+    const signer = orderbookSigning.getOperatorSigner(client, context);
+    vi.spyOn(orderbookSigning, "getOperatorSigner").mockReturnValue({ ...signer, accountId: account });
+    const sign = vi.spyOn(orderbookSigning, "signOrder");
+    installTradingRoutes(server);
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, limitOrderParams);
+    expect(result.humanMessage).toContain("provide an explicit recipient");
+    expect(sign).not.toHaveBeenCalled();
+    for (const path of ["/auth/challenge", "/orders/build", "/orders/save"]) {
+      expect(server.callsTo("POST", path)).toHaveLength(0);
+    }
+    expect(server.callsTo("GET", "/signature/domain")).toHaveLength(0);
+  });
+
+  it("does not resolve the signer key alias when the recipient is explicit", async () => {
+    const signer = orderbookSigning.getOperatorSigner(client, context);
+    vi.spyOn(orderbookSigning, "getOperatorSigner").mockReturnValue({
+      ...signer, accountId: `0.0.${operatorKey.publicKey.toString()}`,
+    });
+    installTradingRoutes(server);
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, {
+      orders: [{ ...limitOrderParams.orders[0], recipient: OPERATOR_RECIPIENT }],
+    });
+    expect(result.humanMessage).toContain("Submitted 1 order(s)");
+  });
+
+  it("preserves an explicit recipient and accepts equivalent address casing", async () => {
+    installTradingRoutes(server, sampleBuiltOrder({
+      output: { ...sampleBuiltOrder().output, recipient: OTHER_RECIPIENT },
+    }));
+    const recipient = "0x" + OTHER_RECIPIENT.slice(2).toUpperCase();
+
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, {
+      orders: [{ ...limitOrderParams.orders[0], recipient }],
+    });
+
+    expect(result.humanMessage).toContain("Submitted 1 order(s)");
+    const build = server.callsTo("POST", "/orders/build")[0].body as {
+      orderRequests: { recipient: string }[];
+    };
+    expect(build.orderRequests[0].recipient).toBe(recipient);
+  });
+
+  it("rejects a substituted explicit recipient before signing or saving", async () => {
+    const sign = vi.spyOn(orderbookSigning, "signOrder");
+    installTradingRoutes(server);
+
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, {
+      orders: [{ ...limitOrderParams.orders[0], recipient: OTHER_RECIPIENT }],
+    });
+
+    expect(result.humanMessage).toContain("Refusing to sign");
+    expect(sign).not.toHaveBeenCalled();
+    expect(server.callsTo("POST", "/orders/save")).toHaveLength(0);
+  });
+
+  it("validates the omitted recipient in every batch entry before the first signature", async () => {
+    const sign = vi.spyOn(orderbookSigning, "signOrder");
+    installTradingRoutes(server);
+    server.on("POST", "/orders/build", () => ({
+      status: 200,
+      body: { orders: [sampleBuiltOrder(), sampleBuiltOrder({
+        output: { ...sampleBuiltOrder().output, recipient: OTHER_RECIPIENT },
+      })] },
+    }));
+
+    const result = await placeOrderbookOrderV3Tool(context).execute(client, context, {
+      orders: [limitOrderParams.orders[0], limitOrderParams.orders[0]],
+    });
+
+    expect(result.humanMessage).toContain("Refusing to sign: order 2");
+    expect(sign).not.toHaveBeenCalled();
+    expect(server.callsTo("POST", "/orders/save")).toHaveLength(0);
   });
 
   it("refuses to sign when /orders/build returns a different order count", async () => {

@@ -5,7 +5,7 @@ import {
     untypedQueryOutputParser,
 } from "@hashgraph/hedera-agent-kit";
 import { z } from "zod";
-import type { Client } from "@hiero-ledger/sdk";
+import { AccountId, type Client } from "@hiero-ledger/sdk";
 import { placeOrderbookOrderV3Parameters } from "../saucer-swap.zod";
 import { OrderbookApiService } from "../service/orderbook-api-service";
 import {
@@ -69,6 +69,22 @@ const postProcess = (orders: SerializedOrder[]) => {
 
 const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
+const operatorRecipient = (accountId: string): string => {
+    const id = AccountId.fromString(accountId);
+    // Public-key aliases do not resolve to an EVM recipient locally. The SDK
+    // otherwise falls back to their zero account number. Nonzero shards/realms
+    // likewise require an explicit recipient rather than a guessed address.
+    if (id.aliasKey || !id.shard.isZero() || !id.realm.isZero()
+        || (!id.evmAddress && id.num.lte(0))) {
+        throw new Error("Cannot establish the operator's output address locally; provide an explicit recipient. No orders were signed or submitted.");
+    }
+    const recipient = `0x${id.toEvmAddress()}`;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(recipient) || /^0x0{40}$/.test(recipient)) {
+        throw new Error("Cannot establish the operator's output address locally; provide an explicit recipient. No orders were signed or submitted.");
+    }
+    return recipient;
+};
+
 /**
  * Anti-blind-signing guard: the server assigns nonce/reactor, but it has NO
  * legitimate reason to change the tokens or amounts the user asked for.
@@ -81,7 +97,7 @@ const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase(
  */
 const assertBuiltOrderMatchesRequest = (
     built: SerializedOrder,
-    request: OrderRequestInput,
+    request: OrderRequestInput & { recipient: string },
     index: number,
 ) => {
     const refuse = (field: string, requested: string, returned: string) => {
@@ -107,7 +123,7 @@ const assertBuiltOrderMatchesRequest = (
     if (built.takerOnce !== (request.takerOnce ?? false)) {
         refuse("takerOnce", String(request.takerOnce ?? false), String(built.takerOnce));
     }
-    if (request.recipient !== undefined && !sameAddress(built.output.recipient, request.recipient)) {
+    if (!sameAddress(built.output.recipient, request.recipient)) {
         refuse("recipient", request.recipient, built.output.recipient);
     }
     if (built.meta?.orderbookId !== undefined && built.meta.orderbookId !== request.orderbookId) {
@@ -192,10 +208,16 @@ export class PlaceOrderbookOrderV3Tool extends BaseTool<
     ) {
         const api = new OrderbookApiService(client.ledgerId);
         const signer = getOperatorSigner(client, context);
+        // Bind the self default locally, never to the recipient or swapper
+        // returned by the API. The SDK handles numeric and EVM-alias IDs.
+        const orderRequests = normalisedParams.orderRequests.map((request) => ({
+            ...request,
+            recipient: request.recipient ?? operatorRecipient(signer.accountId),
+        }));
 
         // Auth happens implicitly (JWT cached per session, re-auth on 401).
         const domain = await api.getDomain(client, context);
-        const builtOrders = await api.buildOrders(client, context, normalisedParams.orderRequests);
+        const builtOrders = await api.buildOrders(client, context, orderRequests);
 
         // Sign each RETURNED order struct — the server assigns nonce/reactor
         // and may clamp the deadline down, so the returned struct (not the
@@ -203,20 +225,20 @@ export class PlaceOrderbookOrderV3Tool extends BaseTool<
         // count parity, then per-field economic equality on EVERY order
         // (anti blind-signing) — no signature is produced until the whole
         // batch validates.
-        if (builtOrders.length !== normalisedParams.orderRequests.length) {
+        if (builtOrders.length !== orderRequests.length) {
             throw new Error(
-                `Refusing to sign: /orders/build returned ${builtOrders.length} order(s) for ${normalisedParams.orderRequests.length} request(s). No orders were submitted; no order signatures left this process.`,
+                `Refusing to sign: /orders/build returned ${builtOrders.length} order(s) for ${orderRequests.length} request(s). No orders were submitted; no order signatures left this process.`,
             );
         }
 
         for (let i = 0; i < builtOrders.length; i++) {
-            assertBuiltOrderMatchesRequest(builtOrders[i], normalisedParams.orderRequests[i], i);
+            assertBuiltOrderMatchesRequest(builtOrders[i], orderRequests[i], i);
         }
 
         const items: SaveOrderItem[] = [];
         for (let i = 0; i < builtOrders.length; i++) {
             const order = builtOrders[i];
-            const request = normalisedParams.orderRequests[i];
+            const request = orderRequests[i];
             const signature = await signOrder(signer, order, domain);
             items.push({
                 order,
