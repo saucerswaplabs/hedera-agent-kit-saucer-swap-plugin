@@ -22,6 +22,9 @@ export type ResolvedSwapV2Context = {
     amountInBase: bigint;
     /** amountIn as the user expressed it. */
     amountInDisplay: number;
+    /** Explicit output floor, exactly converted using tokenOut.decimals. */
+    amountOutMinimumBase: bigint;
+    amountOutMinimumDisplay: string;
     isInputWrappedHBAR: boolean;
     isOutputWrappedHBAR: boolean;
     recipientAccountId: string;
@@ -100,6 +103,31 @@ export default class SaucerSwapV2ParameterNormaliser {
         );
     }
 
+    /** A minimum must never be rounded down: that would weaken the user's limit. */
+    private static normaliseMinimumOutput(amount: string, tokenOut: SaucerSwapTokenInfo): bigint {
+        const decimals = tokenOut.decimals;
+        if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
+            throw new SaucerSwapError('Output token decimals are invalid', 'INVALID_MINIMUM_OUTPUT');
+        }
+        const [whole, fraction = ''] = amount.split('.');
+        // Extra trailing zeros do not change the value; any nonzero discarded digit does.
+        if (/[1-9]/.test(fraction.slice(decimals))) {
+            throw new SaucerSwapError(
+                `Minimum output cannot be represented exactly: ${tokenOut.symbol} has ${decimals} decimals. ` +
+                'Ask the user for a representable minimum; do not round it down.',
+                'INVALID_MINIMUM_OUTPUT',
+            );
+        }
+        const baseUnits = BigInt(whole + fraction.slice(0, decimals).padEnd(decimals, '0'));
+        if (baseUnits <= 0n || baseUnits > (1n << 256n) - 1n) {
+            throw new SaucerSwapError(
+                'Minimum output must fit a positive uint256 amount in output-token base units',
+                'INVALID_MINIMUM_OUTPUT',
+            );
+        }
+        return baseUnits;
+    }
+
     static async normaliseGetSwapQuoteV2Params(
         params: z.infer<ReturnType<typeof getSwapQuoteV2Parameters>>,
         context: Context,
@@ -160,6 +188,8 @@ export default class SaucerSwapV2ParameterNormaliser {
             registry,
         );
 
+        const amountOutMinimum = this.normaliseMinimumOutput(parsedParams.amountOutMinimum, tokenOut);
+
         const recipient = AccountResolver.resolveAccount(parsedParams.recipientAddress, context, client);
         const recipientAddress = await AccountResolver.getHederaEVMAddress(recipient, mirrorNode);
 
@@ -185,7 +215,7 @@ export default class SaucerSwapV2ParameterNormaliser {
                 : recipientAddress,
             deadline: Math.floor(Date.now() / 1000) + SAUCER_SWAP_CONFIG.DEFAULT_DEADLINE_SECONDS,
             amountIn: amountIn,
-            amountOutMinimum: 0
+            amountOutMinimum,
         };
 
         const swapEncoded = abiSwapRouterInterface.encodeFunctionData('exactInput', [exactInputParams]);
@@ -193,7 +223,7 @@ export default class SaucerSwapV2ParameterNormaliser {
         const multiCallParam = [
             swapEncoded,
             isOutputWrappedHBAR
-                ? abiSwapRouterInterface.encodeFunctionData('unwrapWHBAR', [0, recipientAddress])
+                ? abiSwapRouterInterface.encodeFunctionData('unwrapWHBAR', [amountOutMinimum, recipientAddress])
                 : abiSwapRouterInterface.encodeFunctionData('refundETH'),
         ];
 
@@ -215,6 +245,8 @@ export default class SaucerSwapV2ParameterNormaliser {
                 tokenOut,
                 amountInBase: amountIn,
                 amountInDisplay: parsedParams.amountIn,
+                amountOutMinimumBase: amountOutMinimum,
+                amountOutMinimumDisplay: parsedParams.amountOutMinimum,
                 isInputWrappedHBAR,
                 isOutputWrappedHBAR,
                 recipientAccountId: recipient,

@@ -30,7 +30,9 @@ const swapV2Prompt = (context: Context = {}) => `
 ${PromptGenerator.getContextSnippet(context)}
 
 This tool will swap tokens using the SaucerSwap V2 protocol. It spends the user's funds, so
-confirm the pair and the amount first — quoting with get_swap_quote_v2_tool beforehand is the norm.
+confirm the pair, input amount and exact minimum output with the user first. A quote is indicative;
+it does not authorize a minimum. Ask for the minimum when it is missing. Never invent one,
+replace it with a fresh quote, or lower it to make a swap succeed.
 
 Token parameters accept whatever the user said: a symbol, a token name, a Hedera token id or an
 EVM address, resolved against live pool data. Never invent a token id — call ${LIST_TOKENS_TOOL}
@@ -51,16 +53,20 @@ Parameters:
 - tokenIn (str, required): The token being sold. Symbol, name, Hedera id ("0.0.456858") or EVM address. "HBAR" is routed via WHBAR.
 - tokenOut (str, required): The token being bought, same formats.
 - amountIn (number, required): The amount of tokenIn to sell, in display units.
+- amountOutMinimum (str, required): The user's approved minimum tokenOut amount in display units,
+  as a plain decimal string, e.g. "6.6". It must be positive and exactly representable using
+  tokenOut's decimals. No exponent notation, rounding, default or automatic slippage adjustment.
 - recipientAddress (str, optional): The account to receive the output tokens. Defaults to the operator account.
 
-Note: the swap executes at whatever price the pool gives — there is no slippage limit — so keep
-amounts modest on low-liquidity pairs.
+The router enforces this output floor, including native-HBAR unwrapping. A swap below it reverts;
+ask the user for a new instruction instead of silently widening the limit.
 `;
 
 const postProcess = (response: RawTransactionResponse, resolved: ResolvedSwapV2Context) =>
     `Swapped ${resolved.amountInDisplay} ` +
     `${describeTokenForUser(resolved.tokenIn.symbol, resolved.tokenIn.id, resolved.isInputWrappedHBAR)} ` +
     `for ${describeTokenForUser(resolved.tokenOut.symbol, resolved.tokenOut.id, resolved.isOutputWrappedHBAR)} ` +
+    `(minimum ${resolved.amountOutMinimumDisplay}), ` +
     `through the ${resolved.feePercent}% fee pool, ` +
     `sent to ${resolved.recipientAccountId}.\nTransaction ID: ${response.transactionId}`;
 
@@ -128,6 +134,8 @@ export class SwapV2Tool extends BaseTool<SwapV2RawParams, SwapV2NormalisedParams
         context: Context,
         client: Client,
     ): Promise<SwapV2NormalisedParams> {
+        // Refuse a missing or malformed user minimum before even loading pool data.
+        const parsedParams = swapV2Parameters().parse(params);
         const mirrorNode = getMirrornodeService(context.mirrornodeService, client.ledgerId!);
         const config = new SaucerSwapV2ConfigService(client.ledgerId!);
         const api = new SaucerSwapApiServiceImpl(client.ledgerId!, config.getSaucerSwapApiKey());
@@ -137,7 +145,7 @@ export class SwapV2Tool extends BaseTool<SwapV2RawParams, SwapV2NormalisedParams
         );
 
         const normalised = await SaucerSwapV2ParameterNormaliser.normaliseSwapV2Params(
-            params, context, config, registry, mirrorNode, client,
+            parsedParams, context, config, registry, mirrorNode, client,
         );
 
         return {
